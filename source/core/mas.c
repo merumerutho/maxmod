@@ -377,6 +377,13 @@ static void mpp_setposition(mpl_layer_information *layer_info, mm_word position)
 
     while (1)
     {
+        // Guard against reading past the 200-byte sequence array
+        if (position >= 200)
+        {
+            mppStop();
+            return;
+        }
+
         layer_info->position = position;
 
         // Get sequence entry
@@ -3565,7 +3572,7 @@ mm_word mpp_Update_ACHN_notest(mpl_layer_information *layer, mm_active_channel *
     // ------------------------------------------------------------------------
 
     if (act_ch->sample == 0) // No sample
-        goto mppt_achn_nostart_;
+        goto mppt_achn_noinst;
 
     period = mpp_Update_ACHN_notest_auto_vibrato(layer, act_ch, period);
 

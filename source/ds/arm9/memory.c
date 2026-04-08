@@ -129,6 +129,10 @@ mm_word mmUnloadEffect(mm_word sample_ID)
     if (sample_data == 0)
         return 2;
 
+    // Check that instance count is nonzero before decrementing
+    if ((sample_data & 0xFF000000) == 0)
+        return 2;
+
     // Decrement instance count
     sample_data -= 1 << 24;
 

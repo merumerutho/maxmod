@@ -996,7 +996,7 @@ mm_mix_pcm16:
 
     cmp     cvol, #0                        // skip mixing if volume is zero
     muleq   r0, sfreq, mixc                 //
-    addeq   r0, sfreq, r0                   // (ie just add mix * freq to position)
+    addeq   sread, sread, r0                // (ie just add mix * freq to position)
     popeq   {rsamp, cbits, rch, pc}         //
 
     ldr     rsrc, =mm_mix_data + MC_FETCH   // point to fetch
