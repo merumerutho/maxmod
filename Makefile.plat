@@ -23,7 +23,7 @@ ifeq ($(SYSTEM),DS9)
 SOURCEDIRS	:= source/ds/common source/ds/arm9
 OPTFLAGS	:= -Os
 endif
-INCLUDEDIRS	:= include source
+INCLUDEDIRS	:= include source ../../include
 
 # Build artifacts
 # ---------------
@@ -108,7 +108,7 @@ CFLAGS		+= -gdwarf-4
 CXXFLAGS	+= -gdwarf-4
 endif
 ifeq ($(SYSTEM),DS7)
-DEFINES		:= -D__NDS__ -DARM7
+DEFINES		:= -D__NDS__ -DARM7 -DMAXTRACKER_MODE
 ARCH		:= -mcpu=arm7tdmi
 endif
 ifeq ($(SYSTEM),DS9)

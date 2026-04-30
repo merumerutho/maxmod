@@ -13,6 +13,12 @@
 #include "core/mas.h"
 #include "core/player_types.h"
 
+#ifdef MAXTRACKER_MODE
+#include "mt_shared.h"
+/* Global pointer to shared state — set by ARM7 on MT_CMD_SET_SHARED */
+MT_SharedPatternState *mt_shared = NULL;
+#endif
+
 #define ARM_CODE   __attribute__((target("arm")))
 
 #ifdef __NDS__
@@ -160,6 +166,246 @@ IWRAM_CODE ARM_CODE mm_word mmAllocChannel(void)
 
 // It returns 0 on error (if the song tries to use more channels than available
 // to Maxmod. On success, it returns 1.
+
+#ifdef MAXTRACKER_MODE
+
+/*
+ * Original MAS-stream pattern reader (renamed so the maxtracker version
+ * can fall back to it for standard MAS playback).
+ */
+static IWRAM_CODE ARM_CODE mm_bool mmReadPattern_original(mpl_layer_information *mpp_layer)
+{
+    mm_word instr_count = mpp_layer->songadr->instr_count;
+    mm_word flags = mpp_layer->flags;
+    mm_module_channel *module_channels = mpp_channels;
+
+    mpp_vars.pattread_p = mpp_layer->pattread;
+    mm_byte *pattern = mpp_vars.pattread_p;
+
+    mm_word update_bits = 0;
+
+    while (1)
+    {
+        mm_byte read_byte = *pattern++;
+        if ((read_byte & 0x7F) == 0)
+            break;
+
+        mm_word pattern_flags = 0;
+        mm_byte chan_num = (read_byte & 0x7F) - 1;
+
+        if (chan_num >= mpp_nchannels)
+            return 0;
+
+        update_bits |= 1 << chan_num;
+        mm_module_channel *module_channel = &(module_channels[chan_num]);
+
+        if (read_byte & (1 << 7))
+            module_channel->cflags = *pattern++;
+
+        mm_word compr_flags = module_channel->cflags;
+
+        if (compr_flags & COMPR_FLAG_NOTE)
+        {
+            mm_byte note = *pattern++;
+            if (note == NOTE_CUT)
+                pattern_flags |= MF_NOTECUT;
+            else if (note == NOTE_OFF)
+                pattern_flags |= MF_NOTEOFF;
+            else
+                module_channel->pnoter = note;
+        }
+
+        if (compr_flags & COMPR_FLAG_INSTR)
+        {
+            mm_byte instr = *pattern++;
+            if ((pattern_flags & (MF_NOTECUT | MF_NOTEOFF)) == 0)
+            {
+                if (instr > instr_count)
+                    instr = 0;
+                if (module_channel->inst != instr)
+                {
+                    if (flags & MAS_HEADER_FLAG_OLD_MODE)
+                        pattern_flags |= MF_START;
+                    pattern_flags |= MF_NEWINSTR;
+                }
+                module_channel->inst = instr;
+            }
+        }
+
+        if (compr_flags & COMPR_FLAG_VOLC)
+            module_channel->volcmd = *pattern++;
+
+        if (compr_flags & COMPR_FLAG_EFFC)
+        {
+            module_channel->effect = *pattern++;
+            module_channel->param = *pattern++;
+        }
+
+        module_channel->flags = pattern_flags | (compr_flags >> 4);
+    }
+
+    mpp_layer->pattread = pattern;
+    mpp_layer->mch_update = update_bits;
+    return 1;
+}
+
+/*
+ * Patched mmReadPattern for MAXTRACKER_MODE.
+ *
+ * When mt_shared->active is set, reads flat MT_Cell arrays from shared RAM
+ * instead of the RLE-compressed MAS pattern stream. This enables live editing:
+ * ARM9 writes cells directly, ARM7 reads them each row.
+ *
+ * When mt_shared->active is 0 (or mt_shared is NULL), falls through to the
+ * original compressed-stream reader for standard .mas playback.
+ */
+/* Track the last position we resolved, so we detect pattern transitions.
+ * Reset to 0xFF on play start (by ARM7 main loop). */
+mm_byte mt_last_position = 0xFF;
+
+IWRAM_CODE ARM_CODE mm_bool mmReadPattern(mpl_layer_information *mpp_layer)
+{
+    /* Fallback: if shared state not set up or not in maxtracker mode */
+    if (!mt_shared || !mt_shared->active)
+        return mmReadPattern_original(mpp_layer);
+
+    /* Detect pattern transition: when the engine's position changes,
+     * resolve the new cells pointer directly from the shared lookup
+     * tables.  This avoids the IPC round-trip to ARM9 that would
+     * otherwise cause row 0 to read stale data from the old pattern. */
+    mm_byte pos = mpp_layer->position;
+    if (pos != mt_last_position)
+    {
+        mt_last_position = pos;
+        if (pos < mt_shared->order_count) {
+            mm_byte patt_idx = mt_shared->orders[pos];
+            if (patt_idx < mt_shared->patt_count) {
+                mt_shared->cells = mt_shared->patterns[patt_idx].cells;
+                mt_shared->nrows = mt_shared->patterns[patt_idx].nrows;
+            }
+        }
+    }
+
+    if (!mt_shared->cells)
+        return mmReadPattern_original(mpp_layer);
+
+    mm_word instr_count = mpp_layer->songadr->instr_count;
+    mm_word flags = mpp_layer->flags;
+    mm_module_channel *module_channels = mpp_channels;
+
+    int row = mpp_layer->row;
+    mm_word update_bits = 0;
+
+    /* Read the flat cell array for this row */
+    int nch = mt_shared->channel_count;
+    const volatile MT_Cell *row_data = &mt_shared->cells[row * nch];
+    if (nch > mpp_nchannels)
+        nch = mpp_nchannels;
+
+    u32 mute = mt_shared->mute_mask;
+
+    for (int ch = 0; ch < nch; ch++)
+    {
+        const volatile MT_Cell *cell = &row_data[ch];
+        mm_module_channel *mc = &module_channels[ch];
+
+        u8 c_note  = cell->note;
+        u8 c_inst  = cell->inst;
+        u8 c_vol   = cell->vol;
+        u8 c_fx    = cell->fx;
+        u8 c_param = cell->param;
+
+        /* Skip completely empty cells.
+         * Empty vol marker depends on mode: XM uses 0, IT uses 0xFF.
+         * Must check the correct empty marker to avoid skipping
+         * valid IT "set volume to 0" commands. */
+        {
+            u8 vol_empty = (flags & MAS_HEADER_FLAG_XM_MODE) ? 0 : 0xFF;
+            if (c_note == 250 && c_inst == 0 && c_vol == vol_empty &&
+                c_fx == 0 && c_param == 0)
+                continue;
+        }
+
+        /* If channel is muted, skip it (don't feed data to the engine) */
+        if (mute & (1u << ch))
+            continue;
+
+        update_bits |= 1 << ch;
+
+        mm_word pattern_flags = 0;
+
+        /* --- Note --- */
+        if (c_note != 250)  /* not NOTE_EMPTY */
+        {
+            if (c_note == 254)       /* NOTE_CUT */
+                pattern_flags |= MF_NOTECUT;
+            else if (c_note == 255)  /* NOTE_OFF */
+                pattern_flags |= MF_NOTEOFF;
+            else
+            {
+                mc->pnoter = c_note;
+                pattern_flags |= MF_START;
+            }
+        }
+
+        /* --- Instrument --- */
+        if (c_inst != 0)
+        {
+            if ((pattern_flags & (MF_NOTECUT | MF_NOTEOFF)) == 0)
+            {
+                u8 inst = c_inst;
+                if (inst > instr_count)
+                    inst = 0;
+
+                if (mc->inst != inst)
+                {
+                    if (flags & MAS_HEADER_FLAG_OLD_MODE)
+                        pattern_flags |= MF_START;
+                    pattern_flags |= MF_NEWINSTR;
+                }
+                mc->inst = inst;
+
+                /* MF_DVOL: set when instrument field is present and the
+                 * note is not a NOTE_OFF/NOTE_CUT. This tells maxmod to
+                 * apply the instrument's default volume. Matches the
+                 * original mmReadPattern where MF_DVOL comes from the
+                 * RLE carry-forward flags (which are only set for normal
+                 * note+instrument rows, not for note-off+instrument). */
+                pattern_flags |= MF_DVOL;
+            }
+        }
+
+        /* --- Volume command --- */
+        /* Empty marker depends on file mode:
+         * XM mode: vol=0 means no command
+         * IT mode: vol=0xFF means no command */
+        {
+            u8 vol_empty = (flags & MAS_HEADER_FLAG_XM_MODE) ? 0 : 0xFF;
+            if (c_vol != vol_empty)
+            {
+                mc->volcmd = c_vol;
+                pattern_flags |= MF_HASVCMD;
+            }
+        }
+
+        /* --- Effect + parameter --- */
+        if (c_fx != 0 || c_param != 0)
+        {
+            mc->effect = c_fx;
+            mc->param = c_param;
+            pattern_flags |= MF_HASFX;
+        }
+
+
+        mc->flags = pattern_flags;
+    }
+
+    mpp_layer->mch_update = update_bits;
+    return 1;
+}
+
+#else /* !MAXTRACKER_MODE — stock maxmod build */
+
 IWRAM_CODE ARM_CODE mm_bool mmReadPattern(mpl_layer_information *mpp_layer)
 {
     // Prepare vars
@@ -261,6 +507,8 @@ IWRAM_CODE ARM_CODE mm_bool mmReadPattern(mpl_layer_information *mpp_layer)
 
     return 1;
 }
+
+#endif /* MAXTRACKER_MODE */
 
 static IWRAM_CODE ARM_CODE __attribute__((noinline))
 mm_byte mmChannelStartACHN(mm_module_channel *module_channel, mm_active_channel *active_channel,
